@@ -40,6 +40,8 @@
 │   │   ├── JsonModel.cpp
 │   │   └── JsonModel.h
 │   ├── app/
+│   │   ├── main.cpp
+│   │   ├── mainwindow.ui
 │   │   ├── mainwindow.cpp
 │   │   └── mainwindow.h
 │   ├── io/
