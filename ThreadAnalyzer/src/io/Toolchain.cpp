@@ -81,9 +81,9 @@ void runClangPluginAnalysis(const QString &file, const QString &outJson) {
          << "-fno-color-diagnostics"
          << getQtCflags()
          << "-Xclang" << "-load"
-         << "-Xclang" << "/home/brunost/ThreadAnalyzer/clang_cfg_plugin/build/CfgMapPlugin.so"
+         << "-Xclang" << "/home/brunost/ThreadAnalyzer/clang_cfg_plugin/build/CfgMapPlugin.so" // ★★ 这里根据自己的实际路径改一下
          << "-Xclang" << "-plugin"
-         << "-Xclang" << "cfg-map-plugin"    // ★ 确保这里和插件注册名一致
+         << "-Xclang" << "cfg-map-plugin"    // 确保这里和插件注册名一致
          << file;
 
     QProcess p;
