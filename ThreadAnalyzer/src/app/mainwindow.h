@@ -5,6 +5,7 @@
 
 #include <QMainWindow>
 #include <QFileSystemModel>
+#include "analysis/JsonModel.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
@@ -43,6 +44,7 @@ private:
                           const QString &sourceFile);
     void logThreadVarLockSummary(const analysis::AnalysisOutput &out);
     void logUninitPtrDerefSummary(const analysis::AnalysisOutput &out);
+    void logStmtSummaryEvent(const analysis::VarEvent &ev);
 
     Ui::MainWindow *ui;
     QString m_projectRoot;
