@@ -90,6 +90,7 @@ struct PtrPointsTo {
     bool mayNull   = false;        // 可能为 nullptr/0
     bool mayHeap   = false;        // 可能指向堆内存（malloc/new）
     bool mayBeUninit = false;        // 可能“尚未初始化”（专门给 CFG 流分析用）
+    bool mayBeInit   = false;   // 存在路径上已初始化
     QSet<QString> vars;            // 可能指向的变量 symbolId 集合（&x / 指向别的指针等）
 
     bool operator==(const PtrPointsTo &other) const {
@@ -97,6 +98,7 @@ struct PtrPointsTo {
                && mayNull     == other.mayNull
                && mayHeap     == other.mayHeap
                && mayBeUninit == other.mayBeUninit
+               && mayBeInit    == other.mayBeInit
                && vars        == other.vars;
     }
     bool operator!=(const PtrPointsTo &other) const {
@@ -144,6 +146,7 @@ struct VarEvent {
 
     // 指针分析：这次解引用是否“可能未初始化”
     bool isUninitPtrDeref = false;
+    bool isDefiniteUninitPtrDeref = false;
 };
 
 // 变量信息（可以来自 globalVars / params / localVars）
