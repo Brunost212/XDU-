@@ -873,7 +873,8 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
 
                         // 指针初始化/分配：认为从这之后“肯定已经初始化过”
                         if (ev.action.startsWith(QStringLiteral("PtrInit")) ||
-                            ev.action.startsWith(QStringLiteral("PtrAlloc")))
+                            ev.action.startsWith(QStringLiteral("PtrAlloc"))||
+                            ev.action == QStringLiteral("PtrAlias"))
                         {
                             mayBeUninit = false;
                         }
@@ -1062,10 +1063,10 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                 attachThreadInfo(ev, func, threadsByFunc);
                                 ev.varName  = ptrLhs->varName;
                                 ev.symbolId = ptrLhs->symbolId;
-                                ev.varType  = n.varType;
-                                ev.isGlobal = n.isGlobal;
-                                ev.isLocal  = n.isLocal;
-                                ev.isParam  = n.isParam;
+                                ev.varType  = ptrLhs->varType;
+                                ev.isGlobal = ptrLhs->isGlobal;
+                                ev.isLocal  = ptrLhs->isLocal;
+                                ev.isParam  = ptrLhs->isParam;
                                 ev.code     = stmtCode;
 
                                 auto &ptrInfo = state.ptrPoints[ptrLhs->symbolId];
