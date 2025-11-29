@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QSharedPointer>
 #include <QString>
+#include <QSet>
 
 class QJsonDocument;
 
@@ -83,10 +84,33 @@ struct VarState {
     QString lastValueHint;      // 简单记录一下最近一次赋值的大概信息（例如 "from malloc"）
 };
 
+// 每个指针变量当前的“指向信息”摘要
+struct PtrPointsTo {
+    bool hasInfo   = false;        // 是否已经有有意义的指向信息
+    bool mayNull   = false;        // 可能为 nullptr/0
+    bool mayHeap   = false;        // 可能指向堆内存（malloc/new）
+    bool mayBeUninit = false;        // 可能“尚未初始化”（专门给 CFG 流分析用）
+    QSet<QString> vars;            // 可能指向的变量 symbolId 集合（&x / 指向别的指针等）
+
+    bool operator==(const PtrPointsTo &other) const {
+        return hasInfo     == other.hasInfo
+               && mayNull     == other.mayNull
+               && mayHeap     == other.mayHeap
+               && mayBeUninit == other.mayBeUninit
+               && vars        == other.vars;
+    }
+    bool operator!=(const PtrPointsTo &other) const {
+        return !(*this == other);
+    }
+};
+
 // 当前分析过程中的状态（按函数/按路径都可以用这个）
 struct AnalysisState {
     // key 用 symbolId，避免重名问题
     QHash<QString, VarState> vars;
+
+    // 新增：每个指针变量的 points-to 信息
+    QHash<QString, PtrPointsTo> ptrPoints;
 };
 
 // 记录“我关心的东西发生了什么变化”的事件
