@@ -35,6 +35,49 @@ static void walkAst(const QSharedPointer<AstNode> &node,
     walkAstRaw(node.data(), fn);
 }
 
+// Result 是你想要“每个结点返回的结果”类型
+// F 的签名是：Result f(const AstNode &node, const QVector<Result> &childrenResults)
+template<typename Result, typename F>
+static Result foldAstRaw(const AstNode *node, const F &f)
+{
+    if (!node) {
+        return Result{};  // 默认构造一个空结果
+    }
+
+    QVector<Result> childResults;
+    childResults.reserve(node->children.size());
+    for (const auto &ch : node->children) {
+        childResults.push_back(foldAstRaw<Result>(ch.data(), f));
+    }
+
+    // 关键：每个结点在“拿到所有子结点的返回值之后”，由 f 来综合
+    return f(*node, childResults);
+}
+
+template<typename Result, typename F>
+static Result foldAst(const QSharedPointer<AstNode> &root, const F &f)
+{
+    return foldAstRaw<Result>(root.data(), f);
+}
+
+// ============= 整条语句的语义摘要（可随时扩展） =============
+struct ExprSummary {
+    bool hasPointerAssign   = false;  // 是否发生指针赋值/初始化
+    bool hasDeref           = false;  // 是否出现 *p 或 p[i]
+    bool hasAddrOf          = false;  // 是否出现 &x
+    bool hasMalloc          = false;  // 是否出现 malloc/calloc/realloc
+    bool hasNew             = false;  // 是否出现 new
+    bool hasCall            = false;  // 是否出现函数调用
+    bool hasCondOp          = false;  // 是否有 ?: 条件表达式
+    bool hasBinaryOp        = false;  // 是否有二元操作符
+    bool hasMemberAccess    = false;  // 是否有成员访问 p->x / p.x
+
+    QSet<QString> usedVars;           // 所有出现的变量 symbolId
+    QSet<QString> calledFuncs;        // 所有调用到的函数 symbolId
+};
+
+
+
 // 去掉最外层 cast / 括号
 static const AstNode *stripCastsAndParens(const AstNode *n)
 {
@@ -74,14 +117,6 @@ static bool isAssignmentOp(const QString &op)
            op == "*=" || op == "/=" || op == "%=" ||
            op == "<<=" || op == ">>=" ||
            op == "&="  || op == "|=" || op == "^=";
-}
-
-// 粗略判断一个类型是不是 mutex，后面你可以根据实际类型字符串再细化
-static bool isMutexType(const QString &t)
-{
-    // 例如 "std::mutex" / "std::recursive_mutex" 等
-    // 这里先只看有没有 "mutex" 子串
-    return t.contains("mutex");
 }
 
 // 找一棵子树里的“第一个指针变量引用”
@@ -146,63 +181,215 @@ enum class PtrAssignKind {
     Null,        // p = nullptr / 0
     Copy,        // p = q
     FromMalloc,  // p = malloc(...)
-    FromNew      // p = new T(...)
+    FromNew,     // p = new T(...)
+    Conditional  // p = ...?...:...
 };
+
+// 对“指针右值表达式”的抽象结果
+struct PtrExprInfo {
+    PtrAssignKind kind = PtrAssignKind::Unknown;
+
+    // 如果是 AddrOf / Copy，这里记录来源变量
+    QString srcName;
+    QString srcSymbolId;
+
+    // 如果是条件表达式，可以记录一下是否混合多种来源（可选）
+    bool fromConditional = false;
+};
+
+// 利用 foldAstRaw 对一棵 RHS 子树做“指针来源求值”
+static PtrExprInfo evalPtrRhsExpr(const AstNode *root)
+{
+    return foldAstRaw<PtrExprInfo>(root,
+                                   [](const AstNode &node, const QVector<PtrExprInfo> &children) {
+                                       PtrExprInfo info;
+
+                                       // 去掉最外层的 cast / 括号，但注意这里只是看“这个结点的语义”，
+                                       // foldAst 的 children 是基于原始 children 算出来的，不受影响。
+                                       const AstNode *n = stripCastsAndParens(&node);
+                                       if (!n) return info;
+
+                                       // 1) p = &x
+                                       if (n->kind == "UnaryOperator" && n->op == "&") {
+                                           if (!n->children.isEmpty()) {
+                                               const AstNode *inner =
+                                                   stripCastsAndParens(n->children.first().data());
+                                               if (inner && inner->kind == "DeclRefExpr") {
+                                                   info.kind        = PtrAssignKind::AddrOf;
+                                                   info.srcName     = inner->varName;
+                                                   info.srcSymbolId = inner->symbolId;
+                                                   return info;
+                                               }
+                                           }
+                                       }
+
+                                       // 2) p = nullptr / 0
+                                       if (n->kind == "CXXNullPtrLiteralExpr") {
+                                           info.kind = PtrAssignKind::Null;
+                                           return info;
+                                       }
+                                       if (n->kind == "IntegerLiteral" && isPointerType(n->varType)) {
+                                           info.kind = PtrAssignKind::Null;
+                                           return info;
+                                       }
+
+                                       // 3) p = q;  （q 也是指针）
+                                       if (n->kind == "DeclRefExpr" && isPointerType(n->varType)) {
+                                           info.kind        = PtrAssignKind::Copy;
+                                           info.srcName     = n->varName;
+                                           info.srcSymbolId = n->symbolId;
+                                           return info;
+                                       }
+
+                                       // 4) p = malloc(...)
+                                       if (n->kind == "CallExpr") {
+                                           if (n->calleeName == "malloc" ||
+                                               n->calleeName == "calloc" ||
+                                               n->calleeName == "realloc")
+                                           {
+                                               info.kind = PtrAssignKind::FromMalloc;
+                                               return info;
+                                           }
+                                       }
+
+                                       // 5) p = new T(...)
+                                       if (n->kind == "CXXNewExpr") {
+                                           info.kind = PtrAssignKind::FromNew;
+                                           return info;
+                                       }
+
+                                       // 6) 条件运算符：cond ? e1 : e2
+                                       if (n->kind == "ConditionalOperator" && children.size() == 3) {
+                                           // children[0] 是条件本身，一般对指针来源没用
+                                           PtrExprInfo tcase = children[1];
+                                           PtrExprInfo fcase = children[2];
+
+                                           // 如果两边来源一致，就退化成同一种来源
+                                           if (tcase.kind == fcase.kind &&
+                                               tcase.kind != PtrAssignKind::Unknown &&
+                                               tcase.srcSymbolId == fcase.srcSymbolId)
+                                           {
+                                               info = tcase;
+                                               return info;
+                                           }
+
+                                           // 否则标记为“条件组合来源”，kind 暂时保持 Unknown，
+                                           // 但 fromConditional = true，方便后续在 VarEvent 里加更具体信息
+                                           info.kind            = PtrAssignKind::Conditional;
+                                           info.fromConditional = true;
+
+                                           // 你也可以选择在这里做更多合并策略，例如优先 malloc 等
+                                           return info;
+                                       }
+
+                                       // 7) 其它结点：如果自己识别不了，就看看子结点有没有有意义的结果
+                                       for (const PtrExprInfo &c : children) {
+                                           if (c.kind != PtrAssignKind::Unknown || c.fromConditional) {
+                                               return c;
+                                           }
+                                       }
+
+                                       // 全部 Unknown，就保持默认
+                                       return info;
+                                   });
+}
+
+static ExprSummary summarizeStmtTree(const QSharedPointer<AstNode> &root)
+{
+    return foldAst<ExprSummary>(root,
+                                [](const AstNode &n, const QVector<ExprSummary> &children) {
+                                    ExprSummary s;
+
+                                    // -------- 1) 先汇总子结点 --------
+                                    for (const auto &c : children) {
+                                        s.hasPointerAssign |= c.hasPointerAssign;
+                                        s.hasDeref         |= c.hasDeref;
+                                        s.hasAddrOf        |= c.hasAddrOf;
+                                        s.hasMalloc        |= c.hasMalloc;
+                                        s.hasNew           |= c.hasNew;
+                                        s.hasCall          |= c.hasCall;
+                                        s.hasCondOp        |= c.hasCondOp;
+                                        s.hasBinaryOp      |= c.hasBinaryOp;
+                                        s.hasMemberAccess  |= c.hasMemberAccess;
+
+                                        s.usedVars.unite(c.usedVars);
+                                        s.calledFuncs.unite(c.calledFuncs);
+                                    }
+
+                                    // -------- 2) 再看当前结点的语义信息 --------
+
+                                    // 指针赋值：在分析器主逻辑中处理，不在这里专门识别
+                                    if ((n.kind == "InitAssign") ||
+                                        (n.kind == "BinaryOperator" && n.op == "="))
+                                    {
+                                        s.hasPointerAssign = true;
+                                    }
+
+                                    // 解引用
+                                    if (n.kind == "UnaryOperator" && n.op == "*")
+                                        s.hasDeref = true;
+                                    if (n.kind == "ArraySubscriptExpr")
+                                        s.hasDeref = true;
+
+                                    // & 取地址
+                                    if (n.kind == "UnaryOperator" && n.op == "&")
+                                        s.hasAddrOf = true;
+
+                                    // malloc / calloc / realloc
+                                    if (n.kind == "CallExpr" &&
+                                        (n.calleeName == "malloc" ||
+                                         n.calleeName == "calloc" ||
+                                         n.calleeName == "realloc"))
+                                    {
+                                        s.hasMalloc = true;
+                                    }
+
+                                    // new 表达式
+                                    if (n.kind == "CXXNewExpr")
+                                        s.hasNew = true;
+
+                                    // 任意函数调用
+                                    if (n.kind == "CallExpr") {
+                                        s.hasCall = true;
+                                        if (!n.calleeSymbolId.isEmpty())
+                                            s.calledFuncs.insert(n.calleeSymbolId);
+                                    }
+
+                                    // ?: 条件表达式
+                                    if (n.kind == "ConditionalOperator")
+                                        s.hasCondOp = true;
+
+                                    // 任意二元操作符
+                                    if (n.kind == "BinaryOperator")
+                                        s.hasBinaryOp = true;
+
+                                    // p->x / p.x
+                                    if (n.kind == "MemberExpr")
+                                        s.hasMemberAccess = true;
+
+                                    // 使用变量
+                                    if (n.kind == "DeclRefExpr" && !n.symbolId.isEmpty())
+                                        s.usedVars.insert(n.symbolId);
+
+                                    return s;
+                                });
+}
 
 // 对 RHS 表达式做分类
 static PtrAssignKind classifyPointerRHS(const AstNode &rhsRoot,
                                         QString &srcName,
                                         QString &srcSymbolId)
 {
-    const AstNode *rhs = stripCastsAndParens(&rhsRoot);
+    const AstNode *rhs = &rhsRoot;
     if (!rhs) return PtrAssignKind::Unknown;
 
-    // 1) 取地址：p = &x;
-    if (rhs->kind == "UnaryOperator" && rhs->op == "&") {
-        if (!rhs->children.isEmpty()) {
-            const AstNode *target = stripCastsAndParens(rhs->children.first().data());
-            if (target && target->kind == "DeclRefExpr") {
-                srcName     = target->varName;
-                srcSymbolId = target->symbolId;
-            }
-        }
-        return PtrAssignKind::AddrOf;
-    }
+    PtrExprInfo info = evalPtrRhsExpr(rhs);
 
-    // 2) nullptr：p = nullptr;
-    if (rhs->kind == "CXXNullPtrLiteralExpr") {
-        return PtrAssignKind::Null;
-    }
+    // 把 evalPtrRhsExpr 的结果映射回老接口
+    srcName     = info.srcName;
+    srcSymbolId = info.srcSymbolId;
 
-    // 3) 0 常量：p = 0;  (IntegerLiteral + 类型是指针)
-    if (rhs->kind == "IntegerLiteral" && isPointerType(rhs->varType)) {
-        return PtrAssignKind::Null;
-    }
-
-    // 4) 直接拷贝：p = q; （DeclRefExpr，其类型是指针）
-    if (rhs->kind == "DeclRefExpr" && isPointerType(rhs->varType)) {
-        srcName     = rhs->varName;
-        srcSymbolId = rhs->symbolId;
-        return PtrAssignKind::Copy;
-    }
-
-    // 5) malloc / calloc / realloc
-    if (rhs->kind == "CallExpr") {
-        if (rhs->calleeName == "malloc" ||
-            rhs->calleeName == "calloc" ||
-            rhs->calleeName == "realloc")
-        {
-            return PtrAssignKind::FromMalloc;
-        }
-    }
-
-    // 6) new 表达式
-    if (rhs->kind == "CXXNewExpr") {
-        return PtrAssignKind::FromNew;
-    }
-
-    // 7) 其它复杂情况暂时算 Unknown，后面你可以继续细化
-    return PtrAssignKind::Unknown;
+    return info.kind;
 }
 
 // 一个“线程实例”：谁创建的哪个入口函数的线程
@@ -512,7 +699,8 @@ static void markLockRegions(const ProgramModel &model,
 static void markUninitializedPtrDerefs(const ProgramModel &model,
                                        QVector<VarEvent> &events)
 {
-    using PtrState = QHash<QString, bool>; // symbolId -> mayBeUninit
+    // symbolId -> 这一点上指针的 points-to / 未初始化 状态
+    using PtrState = QHash<QString, PtrPointsTo>;
 
     // 按函数逐个分析（和 markLockRegions 的结构类似）
     for (const FunctionInfo &func : model.functions) {
@@ -570,10 +758,13 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
         for (auto it = ptrMeta.constBegin(); it != ptrMeta.constEnd(); ++it) {
             const QString &sym = it.key();
             const PtrMeta &m   = it.value();
-            bool mayBeUninit = false;
-            if (m.isLocal && !m.isGlobal && !m.isParam)
-                mayBeUninit = true;
-            baseState.insert(sym, mayBeUninit);
+
+            PtrPointsTo pi;                  // 其它字段保持默认即可
+            if (m.isLocal && !m.isGlobal && !m.isParam) {
+                // 局部指针：入口处“可能未初始化”
+                pi.mayBeUninit = true;
+            }
+            baseState.insert(sym, pi);
         }
 
         // 4) 构建 blockId -> BlockInfo* 映射（方便找 predecessors）
@@ -618,13 +809,16 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                          itMeta != ptrMeta.constEnd(); ++itMeta)
                     {
                         const QString &sym = itMeta.key();
-                        bool baseVal = baseState.value(sym, false);
-                        bool curVal  = newIn.value(sym, baseVal);
-                        bool predVal = ps.value(sym, baseVal);
+
+                        const PtrPointsTo basePi = baseState.value(sym);           // 入口默认
+                        PtrPointsTo curPi        = newIn.value(sym, basePi);       // 当前 in
+                        const PtrPointsTo predPi = ps.value(sym, basePi);          // 某前驱 out
+
                         // may-uninit：只要某个前驱是 true，就保持 true
-                        if (predVal)
-                            curVal = true;
-                        newIn.insert(sym, curVal);
+                        if (predPi.mayBeUninit)
+                            curPi.mayBeUninit = true;
+
+                        newIn.insert(sym, curPi);
                     }
                 }
 
@@ -644,7 +838,7 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                 auto itEvBlock = eventsInBlock.constFind(bid);
                 if (itEvBlock != eventsInBlock.constEnd()) {
                     QVector<int> evIdxs = itEvBlock.value();
-                    // 块内按行号排序
+                    // 块内按行号排序（原逻辑不变）
                     std::sort(evIdxs.begin(), evIdxs.end(),
                               [&](int a, int b) {
                                   const VarEvent &ea = events[a];
@@ -664,8 +858,10 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                         if (!ptrMeta.contains(ev.symbolId))
                             continue;
 
-                        bool baseVal = baseState.value(ev.symbolId, false);
-                        bool mayBeUninit = curState.value(ev.symbolId, baseVal);
+                        PtrPointsTo basePi = baseState.value(ev.symbolId);
+                        PtrPointsTo curPi  = curState.value(ev.symbolId, basePi);
+
+                        bool mayBeUninit = curPi.mayBeUninit;
 
                         // 指针解引用：如果当前状态“可能未初始化”，标记这次解引用
                         if (ev.action == QStringLiteral("PtrDeref")) {
@@ -682,7 +878,9 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                             mayBeUninit = false;
                         }
 
-                        curState.insert(ev.symbolId, mayBeUninit);
+                        // 把状态写回 curPi / curState
+                        curPi.mayBeUninit = mayBeUninit;
+                        curState.insert(ev.symbolId, curPi);
                     }
                 }
 
@@ -716,6 +914,41 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
 
         for (const auto &block : func.blocks) {
             for (const auto &stmt : block.stmts) {
+
+                if (stmt.tree) {
+                    ExprSummary sum = summarizeStmtTree(stmt.tree);
+
+                    analysis::VarEvent sev;
+                    sev.funcName = func.name;
+                    sev.blockId = block.id;
+                    sev.line = stmt.line;
+                    sev.code = stmt.code;
+                    sev.action = "StmtSummary";
+
+                    QStringList parts;
+                    if (sum.hasPointerAssign) parts << "指针赋值/初始化";
+                    if (sum.hasCondOp)        parts << "条件运算 ?:";
+                    if (sum.hasMalloc)        parts << "malloc/calloc/realloc";
+                    if (sum.hasNew)           parts << "new";
+                    if (sum.hasDeref)         parts << "解引用";
+                    if (sum.hasAddrOf)        parts << "取地址 &";
+                    if (sum.hasCall)          parts << "函数调用";
+                    if (sum.hasBinaryOp)      parts << "二元运算";
+                    if (sum.hasMemberAccess)  parts << "成员访问";
+
+                    if (!sum.usedVars.isEmpty()) {
+                        parts << QString("使用变量%1个").arg(sum.usedVars.size());
+                    }
+
+                    if (!sum.calledFuncs.isEmpty()) {
+                        parts << QString("调用函数%1个").arg(sum.calledFuncs.size());
+                    }
+
+                    sev.detail = parts.join("；");
+                    out.events.push_back(sev);
+                }
+
+
                 if (!stmt.tree)
                     continue;
 
@@ -835,6 +1068,12 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                 ev.isParam  = n.isParam;
                                 ev.code     = stmtCode;
 
+                                auto &ptrInfo = state.ptrPoints[ptrLhs->symbolId];
+                                ptrInfo.hasInfo = true;          // 从这一刻开始有信息了
+                                ptrInfo.vars.clear();
+                                ptrInfo.mayNull = false;
+                                ptrInfo.mayHeap = false;
+
                                 switch (pk) {
                                 case PtrAssignKind::AddrOf:
                                     ev.action = QStringLiteral("PtrInitAddrOf");
@@ -843,12 +1082,25 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                                          srcName);
                                     vs.lastValueHint =
                                         QStringLiteral("addrOf %1").arg(srcName);
+
+                                    // points-to：指向某个变量
+                                    ptrInfo.vars.insert(srcSym);  // srcSym 是 &谁 的 symbolId
+                                    ptrInfo.mayHeap = false;
+                                    ptrInfo.mayNull = false;
+                                    break;
+
                                     break;
                                 case PtrAssignKind::Null:
                                     ev.action = QStringLiteral("PtrInitNull");
-                                    ev.detail = QStringLiteral("指针 %1 赋值为 nullptr/0")
+                                    ev.detail = QStringLiteral("指针 %1 赋值为 nullptr")
                                                     .arg(ptrLhs->varName);
                                     vs.lastValueHint = QStringLiteral("null");
+
+                                    // points-to：只可能是 null
+                                    ptrInfo.vars.clear();
+                                    ptrInfo.mayNull = true;
+                                    ptrInfo.mayHeap = false;
+
                                     break;
                                 case PtrAssignKind::Copy:
                                     ev.action = QStringLiteral("PtrAlias");
@@ -857,18 +1109,46 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                                          srcName);
                                     vs.lastValueHint =
                                         QStringLiteral("alias of %1").arg(srcName);
+
+                                    //更新 points-to：拷贝源指针的指向信息
+                                    ptrInfo = state.ptrPoints.value(srcSym, PtrPointsTo{});
+                                    ptrInfo.hasInfo = true;
+
                                     break;
                                 case PtrAssignKind::FromMalloc:
                                     ev.action = QStringLiteral("PtrAllocMalloc");
                                     ev.detail = QStringLiteral("指针 %1 从 malloc/calloc/realloc 分配")
                                                     .arg(ptrLhs->varName);
                                     vs.lastValueHint = QStringLiteral("from malloc");
+
+                                    // points-to：指向堆
+                                    ptrInfo.vars.clear();
+                                    ptrInfo.mayHeap = true;
+                                    ptrInfo.mayNull = false;
+
                                     break;
                                 case PtrAssignKind::FromNew:
                                     ev.action = QStringLiteral("PtrAllocNew");
                                     ev.detail = QStringLiteral("指针 %1 从 new 表达式分配")
                                                     .arg(ptrLhs->varName);
                                     vs.lastValueHint = QStringLiteral("from new");
+
+                                    // 更新 points-to：指向堆（C++ new）
+                                    ptrInfo.vars.clear();
+                                    ptrInfo.mayHeap = true;
+                                    ptrInfo.mayNull = false;
+
+                                    break;
+                                case PtrAssignKind::Conditional:
+                                    ev.action = QStringLiteral("PtrInitConditional");
+                                    ev.detail = QStringLiteral("指针 %1 通过条件表达式初始化")
+                                                    .arg(ptrLhs->varName);
+                                    vs.lastValueHint = QStringLiteral("conditional init");
+
+                                    ptrInfo.hasInfo = true;
+                                    ptrInfo.vars.clear();
+                                    ptrInfo.mayHeap = true;
+                                    ptrInfo.mayNull = true;
                                     break;
                                 case PtrAssignKind::Unknown:
                                 default:
@@ -876,6 +1156,12 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                     ev.detail = QStringLiteral("指针 %1 赋值/初始化")
                                                     .arg(ptrLhs->varName);
                                     vs.lastValueHint = QStringLiteral("unknown init");
+
+                                    // 更新 points-to：我们知道被重新赋值了，但不知道具体指向，设成“未知”
+                                    ptrInfo.vars.clear();
+                                    ptrInfo.mayNull = true;   // 保守一点：可能为 null
+                                    ptrInfo.mayHeap = true;   // 也可能指向堆
+
                                     break;
                                 }
 
