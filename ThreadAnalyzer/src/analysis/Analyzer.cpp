@@ -759,10 +759,15 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
             const QString &sym = it.key();
             const PtrMeta &m   = it.value();
 
-            PtrPointsTo pi;                  // 其它字段保持默认即可
+            PtrPointsTo pi;
             if (m.isLocal && !m.isGlobal && !m.isParam) {
-                // 局部指针：入口处“可能未初始化”
+                // 局部指针：入口时一定未初始化
                 pi.mayBeUninit = true;
+                pi.mayBeInit   = false;
+            } else {
+                // 参数 / 全局：默认认为已经初始化过
+                pi.mayBeUninit = false;
+                pi.mayBeInit   = true;
             }
             baseState.insert(sym, pi);
         }
@@ -796,13 +801,14 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                     continue; // 这个块里没有事件，先忽略（也可以照样处理）
 
                 // 6.1 计算 inState[bid]：来自所有前驱 outState 的 OR（may-uninit）
-                PtrState newIn = baseState;
+                PtrState newIn;          // 一开始是空
                 bool hasPred = false;
 
                 for (int predId : b.predecessors) {
                     if (!blockIds.contains(predId))
                         continue;
                     hasPred = true;
+
                     const PtrState &ps = outState[predId];
 
                     for (auto itMeta = ptrMeta.constBegin();
@@ -810,19 +816,26 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                     {
                         const QString &sym = itMeta.key();
 
-                        const PtrPointsTo basePi = baseState.value(sym);           // 入口默认
-                        PtrPointsTo curPi        = newIn.value(sym, basePi);       // 当前 in
-                        const PtrPointsTo predPi = ps.value(sym, basePi);          // 某前驱 out
+                        const PtrPointsTo basePi = baseState.value(sym);
+                        const PtrPointsTo predPi = ps.value(sym, basePi);
 
-                        // may-uninit：只要某个前驱是 true，就保持 true
+                        // 第一次看到这个 sym，就直接用这个前驱的状态当作初始值
+                        PtrPointsTo curPi = newIn.contains(sym) ? newIn.value(sym)
+                                                                : predPi;
+
+                        // may-uninit：任一前驱为 true -> true
                         if (predPi.mayBeUninit)
                             curPi.mayBeUninit = true;
+
+                        // may-init：任一前驱为 true -> true（前提是你已经在初始化事件里设过）
+                        if (predPi.mayBeInit)
+                            curPi.mayBeInit = true;
 
                         newIn.insert(sym, curPi);
                     }
                 }
 
-                // 没有前驱（入口块），inState 就是 baseState
+                // 没有前驱：函数入口块，inState 就是 baseState
                 if (!hasPred) {
                     newIn = baseState;
                 }
@@ -862,25 +875,33 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                         PtrPointsTo curPi  = curState.value(ev.symbolId, basePi);
 
                         bool mayBeUninit = curPi.mayBeUninit;
+                        bool mayBeInit   = curPi.mayBeInit;
 
-                        // 指针解引用：如果当前状态“可能未初始化”，标记这次解引用
+                        // 1) 指针解引用：根据两位状态来区分
                         if (ev.action == QStringLiteral("PtrDeref")) {
                             if (mayBeUninit) {
+                                // 兼容原来的字段：只要有风险就为 true
                                 ev.isUninitPtrDeref = true;
+
+                                // 新增一个字段，用来区分“一定 / 可能”
+                                // 你可以在 VarEvent 里加：
+                                //   bool isDefiniteUninitPtrDeref = false;
+                                ev.isDefiniteUninitPtrDeref = !mayBeInit;
+                                //   - mayBeUninit == true && mayBeInit == false → 一定未初始化
+                                //   - mayBeUninit == true && mayBeInit == true  → 可能未初始化
                             }
-                            // 解引用本身不改变初始化状态
                         }
 
-                        // 指针初始化/分配：认为从这之后“肯定已经初始化过”
+                        // 2) 指针初始化/分配：从这之后沿当前路径上肯定已初始化
                         if (ev.action.startsWith(QStringLiteral("PtrInit")) ||
-                            ev.action.startsWith(QStringLiteral("PtrAlloc"))||
-                            ev.action == QStringLiteral("PtrAlias"))
+                            ev.action.startsWith(QStringLiteral("PtrAlloc")))
                         {
                             mayBeUninit = false;
+                            mayBeInit   = true;
                         }
 
-                        // 把状态写回 curPi / curState
                         curPi.mayBeUninit = mayBeUninit;
+                        curPi.mayBeInit   = mayBeInit;
                         curState.insert(ev.symbolId, curPi);
                     }
                 }
