@@ -74,6 +74,29 @@ void MainWindow::log(const QString &msg)
     QApplication::processEvents();
 }
 
+void MainWindow::logStmtSummaryEvent(const analysis::VarEvent &ev)
+{
+    log(QString());
+    // 头部标签
+    log(tr("【语句摘要】"));
+
+    // 基本位置信息：函数 / block / 行号
+    log(tr("  函数 %1, B%2, 行 %3")
+            .arg(ev.funcName)
+            .arg(ev.blockId)
+            .arg(ev.line));
+
+    // 原始语句源码
+    if (!ev.code.isEmpty()) {
+        log(tr("  语句: %1").arg(ev.code));
+    }
+
+    // 详细解释（你在 Analyzer 里根据 ExprSummary 拼的字符串）
+    if (!ev.detail.isEmpty()) {
+        log(tr("  说明: %1").arg(ev.detail));
+    }
+
+}
 
 // 变量级别的摘要 / 简单告警
 void MainWindow::logAnalysisSummary(MainWindow *self,
@@ -122,7 +145,17 @@ void MainWindow::logAnalysisEvents(MainWindow *self,
                                    const analysis::AnalysisOutput &out,
                                    const QString &sourceFile)
 {
+    if (!self) return;
+
     for (const analysis::VarEvent &ev : out.events) {
+
+        // ① 新增：专门处理“整条语句摘要”事件
+        if (ev.action == QStringLiteral("StmtSummary")) {
+            self->logStmtSummaryEvent(ev);
+            continue;   // 不再走下面通用格式
+        }
+
+        // ② 原来的通用事件打印逻辑保持不变
         QString threadPrefix;
         if (!ev.threadVarName.isEmpty()) {
             threadPrefix = self->tr("线程 %1(%2, entry=%3), ")
