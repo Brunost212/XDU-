@@ -340,7 +340,7 @@ void MainWindow::logUninitPtrDerefSummary(const analysis::AnalysisOutput &out)
     log(tr("===== 未初始化指针解引用检查 ====="));
 
     for (const analysis::VarEvent &ev : out.events) {
-        // 只关心指针解引用，且被分析标记为“可能未初始化”
+        // 只关心指针解引用，且被分析标记为“存在未初始化风险”
         if (ev.action != QStringLiteral("PtrDeref"))
             continue;
         if (!ev.isUninitPtrDeref)
@@ -352,6 +352,16 @@ void MainWindow::logUninitPtrDerefSummary(const analysis::AnalysisOutput &out)
         else if (ev.isLocal)  scope = tr("局部变量");
         else if (ev.isGlobal) scope = tr("全局变量");
         else                  scope = tr("未知作用域");
+
+        // 严重程度：一定未初始化 / 可能未初始化
+        QString severity;
+        if (ev.isDefiniteUninitPtrDeref) {
+            // 所有路径上都未初始化
+            severity = tr("【一定未初始化】");
+        } else {
+            // 有的路径初始化，有的路径未初始化
+            severity = tr("【可能未初始化】");
+        }
 
         // 带上线程前缀（如果有线程信息）
         QString threadPrefix;
@@ -370,16 +380,17 @@ void MainWindow::logUninitPtrDerefSummary(const analysis::AnalysisOutput &out)
             ev.varName.isEmpty() ? QStringLiteral("<匿名>") : ev.varName;
 
         const QString msg =
-            tr("【未初始化指针解引用】%1变量 %2 [%3], %4 (symbolId=%5) 在函数 %6, B%7, 行 %8\n    语句: %9")
-                .arg(threadPrefix)
-                .arg(varName)
-                .arg(ev.varType)
-                .arg(scope)
-                .arg(ev.symbolId)
-                .arg(ev.funcName)
-                .arg(ev.blockId)
-                .arg(ev.line)
-                .arg(ev.code);
+            tr("%1%2变量 %3 [%4], %5 (symbolId=%6) 在函数 %7, B%8, 行 %9\n    语句: %10")
+                .arg(severity)      // 【一定未初始化】 / 【可能未初始化】
+                .arg(threadPrefix)  // 线程信息（如果有的话）
+                .arg(varName)       // 变量名
+                .arg(ev.varType)    // 类型
+                .arg(scope)         // 作用域描述
+                .arg(ev.symbolId)   // symbolId
+                .arg(ev.funcName)   // 函数名
+                .arg(ev.blockId)    // CFG block id
+                .arg(ev.line)       // 行号
+                .arg(ev.code);      // 源代码片段
 
         log(msg);
     }
