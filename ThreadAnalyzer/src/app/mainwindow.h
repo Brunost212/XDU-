@@ -33,9 +33,6 @@ private:
     void log(const QString& msg);
 
     // 专门负责把分析结果输出到 log
-    void logAnalysisSummary(MainWindow *self,
-                            const analysis::AnalysisOutput &out,
-                            const QString &sourceFile);
     void logAnalysisEvents(MainWindow *self,
                            const analysis::AnalysisOutput &out,
                            const QString &sourceFile);
