@@ -9,6 +9,10 @@ namespace analysis {
 // ---------- 内部小工具：遍历 AST / 指针分类 ----------
 
 namespace {
+// 如果为 true：参数/全局指针在函数入口默认视为“已初始化”
+// 如果为 false：参数/全局指针在函数入口视为“未知”（既可能已初始化，也可能未初始化）
+static constexpr bool kAssumeParamAndGlobalInitialized = true;
+
 
 // 简单判断一个类型串是不是“指针类型”
 static bool isPointerType(const QString &t)
@@ -182,7 +186,8 @@ enum class PtrAssignKind {
     Copy,        // p = q
     FromMalloc,  // p = malloc(...)
     FromNew,     // p = new T(...)
-    Conditional  // p = ...?...:...
+    Conditional,  // p = ...?...:...
+    FromCall
 };
 
 // 对“指针右值表达式”的抽象结果
@@ -248,6 +253,13 @@ static PtrExprInfo evalPtrRhsExpr(const AstNode *root)
                                                n->calleeName == "realloc")
                                            {
                                                info.kind = PtrAssignKind::FromMalloc;
+                                               return info;
+                                           }
+
+                                           // 如果是其它函数调用，而且返回类型是指针
+                                           if (!n->calleeSymbolId.isEmpty() && isPointerType(n->varType)) {
+                                               info.kind        = PtrAssignKind::FromCall;
+                                               info.srcSymbolId = n->calleeSymbolId;  // 记录被调函数的 symbolId
                                                return info;
                                            }
                                        }
@@ -697,6 +709,7 @@ static void markLockRegions(const ProgramModel &model,
 // 使用 CFG 做一次“指针是否可能未初始化”的前向数据流分析，
 // 在 PtrDeref 事件上标记 ev.isUninitPtrDeref = true.
 static void markUninitializedPtrDerefs(const ProgramModel &model,
+                                       const FuncSummaryMap &funcSummaries,
                                        QVector<VarEvent> &events)
 {
     // symbolId -> 这一点上指针的 points-to / 未初始化 状态
@@ -721,6 +734,11 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
 
         if (blockIds.isEmpty())
             continue;
+
+        // 把函数中的所有基本块都纳入数据流分析，避免“中间空块”被跳过
+        for (const BlockInfo &b : func.blocks) {
+            blockIds.insert(b.id);
+        }
 
         // 2) 确定“哪些 symbolId 是指针变量”，以及它们的作用域
         struct PtrMeta {
@@ -760,15 +778,23 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
             const PtrMeta &m   = it.value();
 
             PtrPointsTo pi;
+
             if (m.isLocal && !m.isGlobal && !m.isParam) {
                 // 局部指针：入口时一定未初始化
                 pi.mayBeUninit = true;
                 pi.mayBeInit   = false;
             } else {
-                // 参数 / 全局：默认认为已经初始化过
-                pi.mayBeUninit = false;
-                pi.mayBeInit   = true;
+                if (kAssumeParamAndGlobalInitialized) {
+                    // 保持当前策略：参数 / 全局默认安全
+                    pi.mayBeUninit = false;
+                    pi.mayBeInit   = true;
+                } else {
+                    // 更保守：参数 / 全局入口状态未知
+                    pi.mayBeUninit = true;
+                    pi.mayBeInit   = true;
+                }
             }
+
             baseState.insert(sym, pi);
         }
 
@@ -877,6 +903,27 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                         bool mayBeUninit = curPi.mayBeUninit;
                         bool mayBeInit   = curPi.mayBeInit;
 
+                        // 0：通过参数把“指针地址”传给一个可能初始化它的函数
+                        if (ev.action == QStringLiteral("CallPassAddrOf")) {
+                            if (!ev.symbolIdOfCallee.isEmpty()) {
+                                auto itFun = funcSummaries.constFind(ev.symbolIdOfCallee);
+                                if (itFun != funcSummaries.constEnd()) {
+                                    const FuncPtrSummary &fs = itFun.value();
+
+                                    auto itPE = fs.paramEffects.constFind(ev.paramIndex);
+                                    if (itPE != fs.paramEffects.constEnd()) {
+                                        const FuncPtrSummary::ParamPtrEffect &pe = itPE.value();
+
+                                        if (pe.mayInitPointee) {
+                                            // 这里直接认为：经过这次调用后，调用者的指针已经被初始化
+                                            mayBeUninit = false;
+                                            mayBeInit   = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // 1) 指针解引用：根据两位状态来区分
                         if (ev.action == QStringLiteral("PtrDeref")) {
                             if (mayBeUninit) {
@@ -900,6 +947,28 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                             mayBeInit   = true;
                         }
 
+                        if (ev.action == QStringLiteral("PtrInitFromCall")) {
+                            // ev.calleeSymbolId 需要你在 VarEvent 里加一个字段
+                            auto it = funcSummaries.constFind(ev.symbolIdOfCallee);
+                            if (it != funcSummaries.constEnd()) {
+                                const FuncPtrSummary &fs = it.value();
+
+                                // 如果 callee 的 retMayBeInit = true，则这次调用的返回值“在某些路径上已初始化”
+                                if (fs.retMayBeInit)
+                                    mayBeInit = true;
+
+                                // 如果 callee 的 retMayBeUninit = true，则这里也要把 mayBeUninit 置 true
+                                if (fs.retMayBeUninit)
+                                    mayBeUninit = true;
+
+                                // 如果 callee.retMayBeHeap=true，你还可以在 PtrPointsTo 里把 mayHeap=true 等
+                            } else {
+                                // 找不到 summary，就退回到保守策略：视作“可能初始化也可能未初始化”
+                                mayBeInit   = true;
+                                mayBeUninit = true;
+                            }
+                        }
+
                         curPi.mayBeUninit = mayBeUninit;
                         curPi.mayBeInit   = mayBeInit;
                         curState.insert(ev.symbolId, curPi);
@@ -909,6 +978,355 @@ static void markUninitializedPtrDerefs(const ProgramModel &model,
                 if (curState != outState[bid]) {
                     outState[bid] = curState;
                     changed = true;
+                }
+            }
+        }
+    }
+}
+
+// 基于当前 TU 的 ProgramModel + 所有事件，
+// 对每个函数单独做一次“指针数据流”，生成局部 FuncPtrSummary。
+static FuncSummaryMap buildLocalFuncSummaries(const ProgramModel &model,
+                                              const QVector<VarEvent> &events)
+{
+    FuncSummaryMap result;
+
+    // 逻辑结构基本和 markUninitializedPtrDerefs 一样：按函数循环
+    for (const FunctionInfo &func : model.functions) {
+
+        // 1) 先看这个函数返回类型是不是指针（需要 clang 插件给出函数返回类型；
+        //    现在 FunctionInfo 里没有，可以：
+        //    - 要么在 JsonModel 里给 FunctionInfo 加个 resultType
+        //    - 要么先简单根据事件中有没有 ReturnPtr 来判断 returnsPointer
+        FuncPtrSummary sum;
+        sum.returnsPointer = false; // 先默认 false，后面看有没有 ReturnPtr 再改
+
+        // 建立形参 symbolId -> 下标 的映射
+        QHash<QString, int> paramIndexBySym;
+        for (int i = 0; i < func.params.size(); ++i) {
+            const QString &sid = func.params[i].symbolId;
+            if (!sid.isEmpty())
+                paramIndexBySym.insert(sid, i);
+        }
+
+        // 1.1 收集本函数里的事件，按 blockId 分组
+        QHash<int, QVector<int>> eventsInBlock;
+
+        bool hasParamOut = false;
+
+        for (int i = 0; i < events.size(); ++i) {
+            const VarEvent &ev = events[i];
+            if (ev.funcName != func.name)
+                continue;
+            if (ev.blockId < 0)
+                continue;
+
+            eventsInBlock[ev.blockId].push_back(i);
+
+            if (ev.action == QStringLiteral("ReturnPtr")) {
+                sum.returnsPointer = true;
+            }
+
+            if (ev.action == QStringLiteral("ParamPtrInit")) {
+                hasParamOut = true;
+                auto it = paramIndexBySym.constFind(ev.symbolId);
+                if (it != paramIndexBySym.constEnd()) {
+                    int idx = it.value();
+                    auto &pe = sum.paramEffects[idx];
+                    pe.mayInitPointee = true;
+                }
+            }
+        }
+
+        // 这里再构建 blockIds，把“这个函数里的所有基本块”都纳入分析
+        QSet<int> blockIds;
+        for (const BlockInfo &b : func.blocks) {
+            blockIds.insert(b.id);
+        }
+
+        if (!sum.returnsPointer && !hasParamOut)
+            continue;
+
+        // 2) 和 markUninitializedPtrDerefs 一样，构建 ptrMeta，只挑指针变量
+        struct PtrMeta { bool isPtr = false; };
+        QHash<QString, PtrMeta> ptrMeta;
+
+        for (int i = 0; i < events.size(); ++i) {
+            const VarEvent &ev = events[i];
+            if (ev.funcName != func.name)
+                continue;
+            if (ev.symbolId.isEmpty())
+                continue;
+            if (!isPointerType(ev.varType))
+                continue;
+            ptrMeta[ev.symbolId].isPtr = true;
+        }
+        if (ptrMeta.isEmpty())
+            continue;
+
+        // 3) baseState：入口处的默认状态
+        //    因为这是“函数局部分析”，我们希望表示：
+        //    - 对“这个函数内部自己初始化过的指针” → mayBeInit=true
+        //    - 对没初始化过的 → mayBeUninit=true
+        //    所以这里可以和 markUninitializedPtrDerefs 一样，先给个初值：
+        using PtrState = QHash<QString, PtrPointsTo>;
+        PtrState baseState;
+        for (auto it = ptrMeta.constBegin(); it != ptrMeta.constEnd(); ++it) {
+            const QString &sym = it.key();
+            PtrPointsTo pi;
+            // 这里简单起见：入口处一律 both true，表示“不知道”；
+            // 也可以像 markUninitializedPtrDerefs 那样区分局部/参数/全局。
+            pi.mayBeInit   = false;
+            pi.mayBeUninit = true;
+            baseState.insert(sym, pi);
+        }
+
+        // 4) blockId -> BlockInfo*
+        QHash<int, const BlockInfo*> blocksById;
+        for (const BlockInfo &b : func.blocks) {
+            blocksById.insert(b.id, &b);
+        }
+
+        // 5) in/out 状态
+        QHash<int, PtrState> inState, outState;
+        for (int bid : blockIds) {
+            inState[bid]  = baseState;
+            outState[bid] = baseState;
+        }
+
+        // 6) 数据流迭代（基本照抄 markUninitializedPtrDerefs）
+        bool changed   = true;
+        int  iter      = 0;
+        const int kMaxIter = 1000;
+
+        while (changed && iter++ < kMaxIter) {
+            changed = false;
+
+            for (const BlockInfo &b : func.blocks) {
+                const int bid = b.id;
+                if (!blockIds.contains(bid))
+                    continue;
+
+                // 6.1 inState[bid] = 所有前驱 outState 的 OR
+                PtrState newIn;
+                bool hasPred = false;
+
+                for (int predId : b.predecessors) {
+                    if (!blockIds.contains(predId))
+                        continue;
+                    hasPred = true;
+
+                    const PtrState &ps = outState[predId];
+
+                    for (auto itMeta = ptrMeta.constBegin();
+                         itMeta != ptrMeta.constEnd(); ++itMeta)
+                    {
+                        const QString &sym = itMeta.key();
+                        const PtrPointsTo basePi = baseState.value(sym);
+                        const PtrPointsTo predPi = ps.value(sym, basePi);
+
+                        PtrPointsTo curPi =
+                            newIn.contains(sym) ? newIn.value(sym) : predPi;
+
+                        if (predPi.mayBeUninit)
+                            curPi.mayBeUninit = true;
+                        if (predPi.mayBeInit)
+                            curPi.mayBeInit = true;
+                        if (predPi.mayNull)
+                            curPi.mayNull = true;
+                        if (predPi.mayHeap)
+                            curPi.mayHeap = true;
+
+                        newIn.insert(sym, curPi);
+                    }
+                }
+                if (!hasPred)
+                    newIn = baseState;
+
+                if (newIn != inState[bid]) {
+                    inState[bid] = newIn;
+                    changed = true;
+                }
+
+                // 6.2 块内按事件顺序更新 curState
+                PtrState curState = inState[bid];
+
+                auto itEvBlock = eventsInBlock.constFind(bid);
+                if (itEvBlock != eventsInBlock.constEnd()) {
+                    QVector<int> evIdxs = itEvBlock.value();
+                    std::sort(evIdxs.begin(), evIdxs.end(),
+                              [&](int a, int b) {
+                                  const VarEvent &ea = events[a];
+                                  const VarEvent &eb = events[b];
+                                  if (ea.line != eb.line)
+                                      return ea.line < eb.line;
+                                  return a < b;
+                              });
+
+                    for (int ei : evIdxs) {
+                        VarEvent const &ev = events[ei];
+                        if (ev.symbolId.isEmpty())
+                            continue;
+                        if (!ptrMeta.contains(ev.symbolId))
+                            continue;
+
+                        PtrPointsTo basePi = baseState.value(ev.symbolId);
+                        PtrPointsTo curPi  = curState.value(ev.symbolId, basePi);
+
+                        bool mayBeUninit = curPi.mayBeUninit;
+                        bool mayBeInit   = curPi.mayBeInit;
+                        bool mayNull     = curPi.mayNull;
+                        bool mayHeap     = curPi.mayHeap;
+
+                        // a) 指针初始化/分配：看 action 前缀，初始化之后沿路径上“肯定已初始化”
+                        if (ev.action.startsWith(QStringLiteral("PtrInit")) ||
+                            ev.action.startsWith(QStringLiteral("PtrAlloc")))
+                        {
+                            mayBeUninit = false;
+                            mayBeInit   = true;
+                        }
+
+                        // b) 根据更细的 action 更新 mayNull / mayHeap
+                        if (ev.action == QStringLiteral("PtrInitNull")) {
+                            // 显式赋值为 nullptr
+                            mayNull = true;
+                            mayHeap = false;
+                        } else if (ev.action == QStringLiteral("PtrAllocMalloc") ||
+                                   ev.action == QStringLiteral("PtrAllocNew"))
+                        {
+                            // malloc / new 分配：视作“指向堆”，默认不标记 null
+                            mayHeap = true;
+                            // 是否顺便认为可能为 null，你可以之后根据需求再调，这里先保守为 false
+                        } else if (ev.action == QStringLiteral("PtrInitConditional")) {
+                            // 条件初始化（比如条件表达式里一支是 malloc，一支是 nullptr）
+                            mayHeap = true;
+                            mayNull = true;
+                        } else if (ev.action == QStringLiteral("PtrInitAddrOf")) {
+                            // &x 这种明确是栈/全局，不是堆，也不是 null
+                            mayHeap = false;
+                            // mayNull 保持之前的值
+                        } else if (ev.action == QStringLiteral("PtrAlias")) {
+                            // 目前 local summary 里没记别名来源，先保持现状，不额外改 mayNull/mayHeap
+                        }
+                        // PtrInitFromCall 在本地 summary 里暂时不推断堆/null，
+                        // 这部分交给后面的调用图传播来补足。
+
+                        curPi.mayBeUninit = mayBeUninit;
+                        curPi.mayBeInit   = mayBeInit;
+                        curPi.mayNull     = mayNull;
+                        curPi.mayHeap     = mayHeap;
+                        curState.insert(ev.symbolId, curPi);
+
+                        // c) 如果这是 ReturnPtr，把当前状态写入 summary
+                        if (ev.action == QStringLiteral("ReturnPtr")) {
+                            sum.retMayBeInit   |= curPi.mayBeInit;
+                            sum.retMayBeUninit |= curPi.mayBeUninit;
+
+                            // 新增：返回值是否可能为 heap / null
+                            sum.retMayBeHeap   |= curPi.mayHeap;
+                            sum.retMayBeNull   |= curPi.mayNull;
+                        }
+                    }
+                }
+
+                if (curState != outState[bid]) {
+                    outState[bid] = curState;
+                    changed = true;
+                }
+            }
+        }
+
+        // 7) 把这个函数的 summary 写进 result
+        if (!func.symbolId.isEmpty()) {
+            result.insert(func.symbolId, sum);
+        }
+    }
+
+    return result;
+}
+
+// 利用调用图，自底向上传播函数 pointer summary
+// 利用调用图，自底向上传播函数 pointer summary
+static void propagateFuncSummaries(const ProgramModel &model,
+                                   FuncSummaryMap     &summaries)
+{
+    FuncIndex funcIndex;
+    CallGraph callGraph;
+    buildFuncIndexAndCallGraph(model, funcIndex, callGraph);
+
+    // 反向图：callee -> callers，用于自底向上通知
+    QHash<QString, QSet<QString>> revGraph;
+    for (auto it = callGraph.constBegin(); it != callGraph.constEnd(); ++it) {
+        const QString &caller = it.key();
+        const QSet<QString> &succ = it.value();
+        for (const QString &callee : succ) {
+            revGraph[callee].insert(caller);
+        }
+    }
+
+    // worklist 里放“需要重新检查 summary 的函数 symbolId”
+    QSet<QString>  inWork;
+    QVector<QString> worklist;
+
+    // 初始：把所有有定义的函数都丢进去
+    for (const FunctionInfo &f : model.functions) {
+        if (f.symbolId.isEmpty())
+            continue;
+        inWork.insert(f.symbolId);
+        worklist.push_back(f.symbolId);
+    }
+
+    while (!worklist.isEmpty()) {
+        QString cur = worklist.back();
+        worklist.pop_back();
+        inWork.remove(cur);
+
+        // 没有本地 summary 的函数（比如根本没 ReturnPtr）直接跳过
+        auto itCur = summaries.find(cur);
+        if (itCur == summaries.end())
+            continue;
+
+        FuncPtrSummary oldSum = itCur.value();
+        FuncPtrSummary &curSum = itCur.value();
+
+        // 如果当前函数本身就“不是返回指针的函数”，
+        // 那就没必要从 callee 那里继承 pointer 返回的性质
+        if (!curSum.returnsPointer) {
+            continue;
+        }
+
+        // 遍历当前函数调用到的所有 callee
+        const QSet<QString> succ = callGraph.value(cur);
+        for (const QString &callee : succ) {
+            auto itCal = summaries.constFind(callee);
+            if (itCal == summaries.constEnd())
+                continue;
+
+            const FuncPtrSummary &cs = itCal.value();
+
+            // 只对“返回指针的 callee”做传播
+            if (!cs.returnsPointer)
+                continue;
+
+            // 把 callee 的“可能已初始化/可能未初始化”并到当前函数上
+            // 也就是：如果底层有任意一层可能返回未初始化，所有 wrapper 都要带上这个风险
+            curSum.retMayBeInit   = curSum.retMayBeInit   || cs.retMayBeInit;
+            curSum.retMayBeUninit = curSum.retMayBeUninit || cs.retMayBeUninit;
+        }
+
+        bool changed =
+            (curSum.returnsPointer != oldSum.returnsPointer) ||
+            (curSum.retMayBeInit   != oldSum.retMayBeInit)   ||
+            (curSum.retMayBeUninit != oldSum.retMayBeUninit);
+
+        if (changed) {
+            // 如果 cur 的 summary 发生变化，则所有 caller 可能也会受影响，
+            // 把它们重新丢回 worklist 做一轮
+            const QSet<QString> &callers = revGraph.value(cur);
+            for (const QString &caller : callers) {
+                if (!inWork.contains(caller)) {
+                    inWork.insert(caller);
+                    worklist.push_back(caller);
                 }
             }
         }
@@ -979,6 +1397,33 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                 const int     blockId  = block.id;
 
                 walkAst(stmt.tree, [&](const AstNode &n) {
+                    // -------- 0) Return 语句：如果返回的是指针变量，记录一个事件 --------
+                    if (n.kind == "ReturnStmt") {
+                        if (!n.children.isEmpty()) {
+                            const AstNode *retExpr =
+                                stripCastsAndParens(n.children.first().data());
+
+                            // 返回的是某个指针变量
+                            const AstNode *ptr = findFirstPtrRef(retExpr);
+                            if (ptr && !ptr->symbolId.isEmpty()) {
+                                VarEvent ev;
+                                ev.funcName = func.name;
+                                ev.blockId  = block.id;
+                                ev.line     = stmtLine;
+                                attachThreadInfo(ev, func, threadsByFunc);
+                                ev.varName  = ptr->varName;
+                                ev.symbolId = ptr->symbolId;
+                                ev.varType  = ptr->varType;
+                                ev.isGlobal = ptr->isGlobal;
+                                ev.isLocal  = ptr->isLocal;
+                                ev.isParam  = ptr->isParam;
+                                ev.action   = QStringLiteral("ReturnPtr");
+                                ev.detail   = QStringLiteral("返回指针 %1").arg(ptr->varName);
+                                ev.code     = stmtCode;
+                                out.events.push_back(std::move(ev));
+                            }
+                        }
+                    }
                     // -------- 1) 普通变量使用：DeclRefExpr --------
                     if (n.kind == "DeclRefExpr" && !n.symbolId.isEmpty()) {
                         auto &vs = state.vars[n.symbolId];
@@ -1025,6 +1470,50 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                 ev.action   = QStringLiteral("PtrDeref");
                                 ev.detail   = QStringLiteral("指针 %1 通过 * 解引用").arg(ptr->varName);
                                 ev.code     = stmtCode;
+
+                                // === 构造这次解引用的别名链 ======================
+                                {
+                                    QSet<QString> aliasSyms;
+
+                                    // 1) 先把自己放进去
+                                    if (!ptr->symbolId.isEmpty())
+                                        aliasSyms.insert(ptr->symbolId);
+
+                                    // 2) 当前已知的 points-to 目标
+                                    PtrPointsTo pi = state.ptrPoints.value(ptr->symbolId, PtrPointsTo{});
+                                    for (const QString &v : pi.vars)
+                                        aliasSyms.insert(v);
+
+                                    // 3) 再把“指向同一批目标”的其它指针变量也加进来
+                                    if (!pi.vars.isEmpty()) {
+                                        for (auto it = state.ptrPoints.constBegin();
+                                             it != state.ptrPoints.constEnd(); ++it) {
+                                            const QString &otherSym = it.key();
+                                            if (otherSym == ptr->symbolId)
+                                                continue;
+
+                                            const PtrPointsTo &opi = it.value();
+                                            bool share = false;
+                                            for (const QString &v : pi.vars) {
+                                                if (opi.vars.contains(v)) {
+                                                    share = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (share)
+                                                aliasSyms.insert(otherSym);
+                                        }
+                                    }
+
+                                    QStringList aliasList;
+                                    aliasList.reserve(aliasSyms.size());
+                                    for (const QString &s : aliasSyms)
+                                        aliasList << s;
+
+                                    ev.ptrAliasSymbolIds = aliasList;
+                                }
+                                // ======================================================
+
                                 out.events.push_back(std::move(ev));
                             }
                         }
@@ -1054,6 +1543,45 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                 ev.action   = QStringLiteral("PtrDeref");
                                 ev.detail   = QStringLiteral("指针 %1 通过 [] 解引用").arg(ptr->varName);
                                 ev.code     = stmtCode;
+
+                                {
+                                    QSet<QString> aliasSyms;
+
+                                    if (!ptr->symbolId.isEmpty())
+                                        aliasSyms.insert(ptr->symbolId);
+
+                                    PtrPointsTo pi = state.ptrPoints.value(ptr->symbolId, PtrPointsTo{});
+                                    for (const QString &v : pi.vars)
+                                        aliasSyms.insert(v);
+
+                                    if (!pi.vars.isEmpty()) {
+                                        for (auto it = state.ptrPoints.constBegin();
+                                             it != state.ptrPoints.constEnd(); ++it) {
+                                            const QString &otherSym = it.key();
+                                            if (otherSym == ptr->symbolId)
+                                                continue;
+
+                                            const PtrPointsTo &opi = it.value();
+                                            bool share = false;
+                                            for (const QString &v : pi.vars) {
+                                                if (opi.vars.contains(v)) {
+                                                    share = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (share)
+                                                aliasSyms.insert(otherSym);
+                                        }
+                                    }
+
+                                    QStringList aliasList;
+                                    aliasList.reserve(aliasSyms.size());
+                                    for (const QString &s : aliasSyms)
+                                        aliasList << s;
+
+                                    ev.ptrAliasSymbolIds = aliasList;
+                                }
+
                                 out.events.push_back(std::move(ev));
                             }
                         }
@@ -1109,8 +1637,6 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                     ptrInfo.vars.insert(srcSym);  // srcSym 是 &谁 的 symbolId
                                     ptrInfo.mayHeap = false;
                                     ptrInfo.mayNull = false;
-                                    break;
-
                                     break;
                                 case PtrAssignKind::Null:
                                     ev.action = QStringLiteral("PtrInitNull");
@@ -1172,6 +1698,18 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                     ptrInfo.mayHeap = true;
                                     ptrInfo.mayNull = true;
                                     break;
+                                case PtrAssignKind::FromCall:
+                                    ev.action = QStringLiteral("PtrInitFromCall");
+                                    ev.detail = QStringLiteral("指针 %1 = 调用函数返回值").arg(ptrLhs->varName);
+                                    vs.lastValueHint = QStringLiteral("from call");
+
+                                    ev.symbolIdOfCallee = srcSym;
+
+                                    // points-to 层面你可以先标“未知但已初始化”，等会在数据流里根据 summary 再细化
+                                    ptrInfo.vars.clear();
+                                    ptrInfo.mayHeap = true;  // 先保守认为可能是堆
+                                    ptrInfo.mayNull = true;  // 也可能为 null
+                                    break;
                                 case PtrAssignKind::Unknown:
                                 default:
                                     ev.action = QStringLiteral("PtrInit");
@@ -1188,6 +1726,49 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                 }
 
                                 out.events.push_back(std::move(ev));
+                            } else {
+                                // === 新增：检测 *param = ... 这种“通过参数输出指针”的写法 ===
+                                const AstNode *lhsStripped = stripCastsAndParens(&lhsNode);
+                                if (lhsStripped &&
+                                    lhsStripped->kind == "UnaryOperator" &&
+                                    lhsStripped->op == "*" &&
+                                    !lhsStripped->children.isEmpty())
+                                {
+                                    const AstNode *inner =
+                                        stripCastsAndParens(lhsStripped->children.first().data());
+
+                                    // inner 是一个“指针形参”，例如 int **pp
+                                    if (inner &&
+                                        inner->kind == "DeclRefExpr" &&
+                                        inner->isParam &&
+                                        isPointerType(inner->varType))
+                                    {
+                                        QString srcName;
+                                        QString srcSym;
+                                        PtrAssignKind pk =
+                                            classifyPointerRHS(rhsNode, srcName, srcSym);
+
+                                        // 只在 RHS 明确是指针来源时认为是“初始化调用者指针”
+                                        if (pk != PtrAssignKind::Unknown) {
+                                            VarEvent ev;
+                                            ev.funcName = func.name;
+                                            ev.blockId  = blockId;
+                                            ev.line     = stmtLine;
+                                            attachThreadInfo(ev, func, threadsByFunc);
+                                            ev.varName  = inner->varName;      // 形参名，比如 pp
+                                            ev.symbolId = inner->symbolId;     // 形参 symbolId
+                                            ev.varType  = inner->varType;
+                                            ev.isGlobal = inner->isGlobal;
+                                            ev.isLocal  = inner->isLocal;
+                                            ev.isParam  = inner->isParam;
+                                            ev.action   = QStringLiteral("ParamPtrInit");
+                                            ev.detail   = QStringLiteral("通过 *%1 初始化调用者指针")
+                                                            .arg(inner->varName);
+                                            ev.code     = stmtCode;
+                                            out.events.push_back(std::move(ev));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1334,6 +1915,66 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
                                 out.events.push_back(std::move(ev));
                             }
                         }
+
+                        // 4.x 识别把“指针地址”作为参数传递的情况：foo(&p)
+                        int argIndex = 0;
+
+                        // 注意：children[0] 是 callee（init_out），从 children[1] 起才是实参
+                        for (int childIdx = 0; childIdx < n.children.size(); ++childIdx) {
+
+                            // 对 CallExpr / CXXMemberCallExpr，约定 child[0] 为 callee，跳过
+                            if (childIdx == 0)
+                                continue;
+
+                            const auto &child = n.children[childIdx];
+                            const AstNode *arg = stripCastsAndParens(child.data());
+                            if (!arg) {
+                                ++argIndex;              // 这是第 argIndex 个“实参”，即便解析失败也要占位
+                                continue;
+                            }
+
+                            // 形如：&p
+                            if (arg->kind == "UnaryOperator" &&
+                                arg->op == "&" &&
+                                !arg->children.isEmpty())
+                            {
+                                const AstNode *inner =
+                                    stripCastsAndParens(arg->children.first().data());
+
+                                if (inner &&
+                                    inner->kind == "DeclRefExpr" &&
+                                    isPointerType(inner->varType))
+                                {
+                                    VarEvent ev;
+                                    ev.funcName = func.name;
+                                    ev.blockId  = blockId;
+                                    ev.line     = stmtLine;
+                                    attachThreadInfo(ev, func, threadsByFunc);
+
+                                    ev.varName  = inner->varName;
+                                    ev.symbolId = inner->symbolId;
+                                    ev.varType  = inner->varType;
+                                    ev.isGlobal = inner->isGlobal;
+                                    ev.isLocal  = inner->isLocal;
+                                    ev.isParam  = inner->isParam;
+
+                                    ev.action           = QStringLiteral("CallPassAddrOf");
+                                    ev.symbolIdOfCallee = n.calleeSymbolId;
+                                    ev.paramIndex       = argIndex;   // 现在是正确的“第几个实参”（0-based）
+
+                                    ev.detail = QStringLiteral("将指针 %1 的地址作为第 %2 个参数传给 %3")
+                                                    .arg(inner->varName)
+                                                    .arg(argIndex + 1)
+                                                    .arg(calleeName);
+                                    ev.code = stmtCode;
+
+                                    out.events.push_back(std::move(ev));
+                                }
+                            }
+
+                            ++argIndex;   // 只对“实参”递增，而不是对每个 child 递增
+                        }
+
                     }
 
                     // C++ delete / delete[]
@@ -1373,11 +2014,15 @@ AnalysisOutput analyzeProgram(const ProgramModel &model)
         }
     }
 
+    // 1.x) 先基于事件+CFG生成“函数局部 summary”
+    out.funcSummaries = buildLocalFuncSummaries(model, out.events);
+    propagateFuncSummaries(model, out.funcSummaries);
+
     // 1.5) 根据 MutexLock/MutexUnlock 标记 underLock / heldMutexes
     markLockRegions(model, out.events);
 
     // 1.6) 基于 CFG 分析哪些指针解引用“可能未初始化”
-    markUninitializedPtrDerefs(model, out.events);
+    markUninitializedPtrDerefs(model, out.funcSummaries, out.events);
 
     // 2) 基于事件按变量做汇总（只写不读 / 只读不写 等）
     QSet<QString> varIds;
