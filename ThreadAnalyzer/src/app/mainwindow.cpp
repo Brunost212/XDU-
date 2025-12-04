@@ -98,48 +98,6 @@ void MainWindow::logStmtSummaryEvent(const analysis::VarEvent &ev)
 
 }
 
-// 变量级别的摘要 / 简单告警
-void MainWindow::logAnalysisSummary(MainWindow *self,
-                                    const analysis::AnalysisOutput &out,
-                                    const QString &sourceFile)
-{
-    if (!self) return;
-
-    self->log(self->tr("===== 文件 %1 的变量总结 / 简单告警 =====").arg(sourceFile));
-
-    for (auto it = out.vars.constBegin(); it != out.vars.constEnd(); ++it) {
-        const analysis::VarSummary &sum = it.value();
-
-        // 只读不写：可能未初始化使用
-        if (sum.everUsed && !sum.everAssigned && sum.hasFirstUse) {
-            const analysis::VarEvent &ev = sum.firstUse;
-            const QString msg = self->tr(
-                                        "[可能未初始化使用] %1 (%2, symbol=%3) 在函数 %4, B%5, 行 %6 首次被读取，之前未发现赋值")
-                                    .arg(sum.name)
-                                    .arg(sum.scopeDesc)
-                                    .arg(sum.symbolId)
-                                    .arg(ev.funcName)
-                                    .arg(ev.blockId)
-                                    .arg(ev.line);
-            self->log(msg);
-        }
-
-        // 只写不读：可能赋值未使用
-        if (sum.everAssigned && !sum.everUsed && sum.hasFirstAssign) {
-            const analysis::VarEvent &ev = sum.firstAssign;
-            const QString msg = self->tr(
-                                        "[可能赋值未使用] %1 (%2, symbol=%3) 在函数 %4, B%5, 行 %6 首次被赋值，此后未发现读取")
-                                    .arg(sum.name)
-                                    .arg(sum.scopeDesc)
-                                    .arg(sum.symbolId)
-                                    .arg(ev.funcName)
-                                    .arg(ev.blockId)
-                                    .arg(ev.line);
-            self->log(msg);
-        }
-    }
-}
-
 // 细粒度事件列表
 void MainWindow::logAnalysisEvents(MainWindow *self,
                                    const analysis::AnalysisOutput &out,
@@ -337,7 +295,7 @@ void MainWindow::logThreadVarLockSummary(const analysis::AnalysisOutput &out)
 
 void MainWindow::logUninitPtrDerefSummary(const analysis::AnalysisOutput &out)
 {
-    log(tr("===== 未初始化指针解引用检查 ====="));
+    log(tr("===== 指针解引用检查 ====="));
 
     for (const analysis::VarEvent &ev : out.events) {
         // 只关心指针解引用，且被分析标记为“存在未初始化风险”
@@ -355,11 +313,11 @@ void MainWindow::logUninitPtrDerefSummary(const analysis::AnalysisOutput &out)
 
         // 严重程度：一定未初始化 / 可能未初始化
         QString severity;
-        if (ev.isDefiniteUninitPtrDeref) {
-            // 所有路径上都未初始化
+        if (!ev.isUninitPtrDeref) {
+            severity = tr("【已初始化】");
+        } else if (ev.isDefiniteUninitPtrDeref) {
             severity = tr("【一定未初始化】");
         } else {
-            // 有的路径初始化，有的路径未初始化
             severity = tr("【可能未初始化】");
         }
 
@@ -378,6 +336,40 @@ void MainWindow::logUninitPtrDerefSummary(const analysis::AnalysisOutput &out)
 
         const QString varName =
             ev.varName.isEmpty() ? QStringLiteral("<匿名>") : ev.varName;
+
+        // === 据 ptrAliasSymbolIds 生成“别名/目标变量”说明 ==========
+        QString aliasLine;
+        if (!ev.ptrAliasSymbolIds.isEmpty()) {
+            QStringList aliasNames;
+
+            for (const QString &sym : ev.ptrAliasSymbolIds) {
+                QString name;
+
+                // 自己
+                if (sym == ev.symbolId) {
+                    name = varName;
+                } else {
+                    // 先从 out.vars 里找一下
+                    auto itVar = out.vars.constFind(sym);
+                    if (itVar != out.vars.constEnd() && !itVar->name.isEmpty()) {
+                        name = itVar->name;
+                    } else {
+                        // 找不到就退回 symbolId（至少有信息）
+                        name = sym;
+                    }
+                }
+
+                if (!name.isEmpty() && !aliasNames.contains(name))
+                    aliasNames << name;
+            }
+
+            aliasNames.sort();
+            if (!aliasNames.isEmpty()) {
+                aliasLine = tr("    相关别名/目标变量: %1\n")
+                                .arg(aliasNames.join(QStringLiteral(", ")));
+            }
+        }
+        // =============================================================
 
         const QString msg =
             tr("%1%2变量 %3 [%4], %5 (symbolId=%6) 在函数 %7, B%8, 行 %9\n    语句: %10")
@@ -454,7 +446,6 @@ void MainWindow::on_startAnalyze_Button_clicked()
         }
         logThreadSummary(this, model, file);
         const analysis::AnalysisOutput result = analysis::analyzeProgram(model);
-        logAnalysisSummary(this, result, file);
         logThreadVarLockSummary(result);
         logUninitPtrDerefSummary(result);
         logAnalysisEvents(this, result, file);
