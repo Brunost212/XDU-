@@ -301,8 +301,8 @@ void MainWindow::logUninitPtrDerefSummary(const analysis::AnalysisOutput &out)
         // 只关心指针解引用，且被分析标记为“存在未初始化风险”
         if (ev.action != QStringLiteral("PtrDeref"))
             continue;
-        if (!ev.isUninitPtrDeref)
-            continue;
+        // if (!ev.isUninitPtrDeref)
+        //     continue;
 
         // 作用域描述：参数 / 局部 / 全局
         QString scope;
