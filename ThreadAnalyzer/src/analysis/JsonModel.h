@@ -132,8 +132,10 @@ struct VarEvent {
 
     QString action;   // "Assign" / "Use" / "Free" 等
     QString detail;   // 额外描述（例如赋值表达式的 code）
-
     QString code;     // 整条语句源码
+    QString symbolIdOfCallee; //如果这个事件和函数调用有关，如：PtrInitFromCall，就记录被调函数的symbolId
+
+    int paramIndex = -1; // 记录参数下标
 
     // 线程维度（可选，如果该函数是某个线程入口）
     QString threadVarName;    // 线程对象/句柄变量名，比如 t1 / tid
@@ -147,6 +149,10 @@ struct VarEvent {
     // 指针分析：这次解引用是否“可能未初始化”
     bool isUninitPtrDeref = false;
     bool isDefiniteUninitPtrDeref = false;
+
+    // 指针别名链：在本次指针事件处，认为“相关”的 symbolId 集合
+    // 典型：p = &a; b = p; c = b; 在 *c 这里就记录 {a, b, c, p}
+    QStringList ptrAliasSymbolIds;
 };
 
 // 变量信息（可以来自 globalVars / params / localVars）
