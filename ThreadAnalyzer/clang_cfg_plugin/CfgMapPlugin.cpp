@@ -403,6 +403,7 @@ private:
         }
 
         if (auto *CE = dyn_cast<CallExpr>(S)) {
+            node["varType"] = CE->getType().getAsString();
             const Expr *Callee = CE->getCallee()->IgnoreParenImpCasts();
             if (auto *DRE = dyn_cast<DeclRefExpr>(Callee)) {
                 if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
@@ -795,6 +796,10 @@ private:
         factBase["ptrType"]  = PtrVar->getType().getAsString();
         factBase["ptrName"]  = PtrVar->getNameAsString();
 
+        std::string ptrUsr = getUSRForDecl(PtrVar);
+        if (!ptrUsr.empty())
+            factBase["ptrSymbolId"] = ptrUsr;
+
         // case 1: p = &x;
         if (const auto *UO = llvm::dyn_cast<UnaryOperator>(E)) {
             if (UO->getOpcode() == UO_AddrOf) {
@@ -808,6 +813,12 @@ private:
                             static_cast<int>(getVarId(TargetVD));
                         fact["targetName"]  = TargetVD->getNameAsString();
                         fact["targetType"]  = TargetVD->getType().getAsString();
+
+                        // 右值变量 a 的 symbolId
+                        std::string tgtUsr = getUSRForDecl(TargetVD);
+                        if (!tgtUsr.empty())
+                            fact["targetSymbolId"] = tgtUsr;
+
                         facts.push_back(std::move(fact));
                         return;
                     }
@@ -825,6 +836,12 @@ private:
                     fact["srcVarId"]  = static_cast<int>(getVarId(SrcVD));
                     fact["srcName"]   = SrcVD->getNameAsString();
                     fact["srcType"]   = SrcVD->getType().getAsString();
+
+                    // 右值指针 q 的 symbolId
+                    std::string srcUsr = getUSRForDecl(SrcVD);
+                    if (!srcUsr.empty())
+                        fact["srcSymbolId"] = srcUsr;
+
                     facts.push_back(std::move(fact));
                     return;
                 }
