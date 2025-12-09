@@ -92,14 +92,16 @@ struct PtrPointsTo {
     bool mayBeUninit = false;        // 可能“尚未初始化”（专门给 CFG 流分析用）
     bool mayBeInit   = false;   // 存在路径上已初始化
     QSet<QString> vars;            // 可能指向的变量 symbolId 集合（&x / 指向别的指针等）
+    QSet<QString> heapRegions;
 
     bool operator==(const PtrPointsTo &other) const {
-        return hasInfo     == other.hasInfo
-               && mayNull     == other.mayNull
-               && mayHeap     == other.mayHeap
-               && mayBeUninit == other.mayBeUninit
+        return hasInfo      == other.hasInfo
+               && mayNull      == other.mayNull
+               && mayHeap      == other.mayHeap
+               && mayBeUninit  == other.mayBeUninit
                && mayBeInit    == other.mayBeInit
-               && vars        == other.vars;
+               && vars         == other.vars
+               && heapRegions  == other.heapRegions;
     }
     bool operator!=(const PtrPointsTo &other) const {
         return !(*this == other);
@@ -124,6 +126,10 @@ struct VarEvent {
     QString varName;
     QString varType;
     QString symbolId;
+    QString rhsSymbolId;
+    QString astId;
+
+    PtrPointsTo rhsPoints;
 
     //变量作用域
     bool isGlobal = false;
@@ -149,6 +155,9 @@ struct VarEvent {
     // 指针分析：这次解引用是否“可能未初始化”
     bool isUninitPtrDeref = false;
     bool isDefiniteUninitPtrDeref = false;
+    // 空指针（nullptr / 0）解引用
+    bool isNullPtrDeref          = false;  // 可能是空指针
+    bool isDefiniteNullPtrDeref  = false;  // 一定是空指针
 
     // 指针别名链：在本次指针事件处，认为“相关”的 symbolId 集合
     // 典型：p = &a; b = p; c = b; 在 *c 这里就记录 {a, b, c, p}
