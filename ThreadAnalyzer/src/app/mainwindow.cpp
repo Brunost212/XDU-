@@ -311,14 +311,29 @@ void MainWindow::logUninitPtrDerefSummary(const analysis::AnalysisOutput &out)
         else if (ev.isGlobal) scope = tr("全局变量");
         else                  scope = tr("未知作用域");
 
-        // 严重程度：一定未初始化 / 可能未初始化
         QString severity;
-        if (!ev.isUninitPtrDeref) {
+        QStringList tags;
+
+        // 未初始化
+        if (ev.isUninitPtrDeref) {
+            if (ev.isDefiniteUninitPtrDeref)
+                tags << tr("一定未初始化");
+            else
+                tags << tr("可能未初始化");
+        }
+
+        // 空指针
+        if (ev.isNullPtrDeref) {
+            if (ev.isDefiniteNullPtrDeref)
+                tags << tr("一定为空指针");
+            else
+                tags << tr("可能为空指针");
+        }
+
+        if (tags.isEmpty()) {
             severity = tr("【已初始化】");
-        } else if (ev.isDefiniteUninitPtrDeref) {
-            severity = tr("【一定未初始化】");
         } else {
-            severity = tr("【可能未初始化】");
+            severity = QStringLiteral("【%1】").arg(tags.join(QStringLiteral(" / ")));
         }
 
         // 带上线程前缀（如果有线程信息）
